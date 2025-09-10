@@ -4,7 +4,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from upcycle_heads import upcycle_heads_inplace
 from train_upcycled import enable_moh_training, auto_device, auto_dtype
 
-ckpt = "/Users/michaelofengenden/Desktop/UpcycleBase/gemma3-1b-it-upcycled-heads-trained/checkpoint-650"
+ckpt = "/Users/michaelofengenden/Desktop/UpcycleBase/gemma3-1b-it-upcycled-heads-trained/checkpoint-800"
 base_id = "google/gemma-3-1b-it"
 device = auto_device()
 dtype = auto_dtype(device)
@@ -45,7 +45,7 @@ for _, attn in model.named_modules():
     if hasattr(attn, "set_moh"):
         attn.set_moh(enabled=True, identity_shortcut=False)
 with torch.no_grad():
-    out_routed = model.generate(**inputs, max_new_tokens=48, do_sample=False)
+    out_routed = model.generate(**inputs, max_new_tokens=128, do_sample=False)
 routed_txt = tok.decode(out_routed[0], skip_special_tokens=True)
 
 print("baseline == routed:", base_txt == routed_txt)
