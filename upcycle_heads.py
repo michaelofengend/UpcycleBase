@@ -55,10 +55,12 @@ def upcycle_heads_inplace(model, factor=2, top_k=None):
         setattr(attn, "q_proj_extra", q_extra)
 
         # Control buffers
-        attn.register_buffer("_moh_top_k", torch.tensor(int(top_k)))  # scalar
+        attn.register_buffer("_moh_top_k", torch.tensor(int(top_k)))  # scalar (reserved)
         attn.register_buffer("_moh_enabled", torch.tensor(1, dtype=torch.uint8))
         attn.register_buffer("_moh_identity_shortcut", torch.tensor(1, dtype=torch.uint8))
         attn.register_buffer("_moh_heads", torch.tensor(H, dtype=torch.int), persistent=False)
+        # Routing mode: 0 = hard per-head top-1 (orig vs extra); 1 = soft blend (weighted)
+        attn.register_buffer("_moh_mode", torch.tensor(0, dtype=torch.uint8))
 
         # Add a tiny learnable router: hidden_size -> 2H logits, biased to pick original H at init
         hidden_size = getattr(attn.q_proj, 'in_features', getattr(model.config, 'hidden_size', None))
@@ -86,11 +88,14 @@ def upcycle_heads_inplace(model, factor=2, top_k=None):
             self._moh_enabled.copy_(val)
         attn.enable_moh = enable_moh.__get__(attn, attn.__class__)
 
-        def set_moh(self, enabled: bool = True, identity_shortcut: bool = True, top_k: int = None):
+        def set_moh(self, enabled: bool = True, identity_shortcut: bool = True, top_k: int = None, mode: str | None = None):
             self._moh_enabled.copy_(torch.tensor(1 if enabled else 0, dtype=torch.uint8, device=self._moh_enabled.device))
             self._moh_identity_shortcut.copy_(torch.tensor(1 if identity_shortcut else 0, dtype=torch.uint8, device=self._moh_identity_shortcut.device))
             if top_k is not None:
                 self._moh_top_k.copy_(torch.tensor(int(top_k), device=self._moh_top_k.device))
+            if mode is not None:
+                mode_val = 0 if str(mode).lower() in ("hard","topk","top_k","argmax") else 1
+                self._moh_mode.copy_(torch.tensor(mode_val, dtype=torch.uint8, device=self._moh_mode.device))
         attn.set_moh = set_moh.__get__(attn, attn.__class__)
 
         # Minimal head routing via projection hooks, preserving the rest of attention (rotary, caches, etc.)
@@ -110,13 +115,21 @@ def upcycle_heads_inplace(model, factor=2, top_k=None):
                 y_orig = y_orig.view(*y_orig.shape[:-1], H_local, head_dim)
                 y_extra = y_extra.view(*y_extra.shape[:-1], H_local, head_dim)
 
-                # Per-head soft blend (orig vs extra) so router gets gradients; preserves H heads alignment
                 logits = attn_module.moh_router(x).view(*x.shape[:-1], H_local, 2)  # [B, T, H, 2]
-                probs = F.softmax(logits, dim=-1)
-                p_orig = probs[..., 0:1]  # [B, T, H, 1]
-                p_extra = probs[..., 1:1+1]
-                y_mix = p_orig * y_orig + p_extra * y_extra  # [B, T, H, Hd]
-                y_out = y_mix.reshape(*y_mix.shape[:-2], -1)
+                if int(attn_module._moh_mode.item()) == 0:
+                    # Hard per-head top-1 (equivalent to per-head top-K over {orig,extra})
+                    choose_extra = logits.argmax(dim=-1)  # [B, T, H] in {0,1}, 1 => extra
+                    y_pair = torch.stack([y_orig, y_extra], dim=-2)  # [B, T, H, 2, Hd]
+                    gather_idx = choose_extra.unsqueeze(-1).unsqueeze(-1).expand(*choose_extra.shape, 1, head_dim)
+                    y_chosen = torch.gather(y_pair, dim=-2, index=gather_idx).squeeze(-2)  # [B, T, H, Hd]
+                    y_out = y_chosen.reshape(*y_chosen.shape[:-2], -1)
+                else:
+                    # Soft blend (weighted)
+                    probs = F.softmax(logits, dim=-1)
+                    p_orig = probs[..., 0:1]  # [B, T, H, 1]
+                    p_extra = probs[..., 1:1+1]
+                    y_mix = p_orig * y_orig + p_extra * y_extra  # [B, T, H, Hd]
+                    y_out = y_mix.reshape(*y_mix.shape[:-2], -1)
                 return y_out
 
             return hook
